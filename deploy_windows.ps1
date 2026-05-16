@@ -71,9 +71,53 @@ foreach ($f in @("README.txt", "COPYING.txt")) {
     if (Test-Path $f) { Copy-Item $f "$DistDir\" }
 }
 
+# Resolve the Qt install root (set by install-qt-action on CI, or fall back
+# to the directory containing qmake locally) so we invoke the windeployqt
+# that matches the Qt we built against — using whatever's on PATH can pick
+# up a stale Qt and breaks platform plugin lookup.
+$QtRoot = $env:QT_ROOT_DIR
+if (-not $QtRoot) {
+    $qmakePath = (Get-Command qmake).Source
+    $QtRoot = Split-Path -Parent (Split-Path -Parent $qmakePath)
+}
+$WindeployQt = Join-Path $QtRoot "bin\windeployqt.exe"
+if (-not (Test-Path $WindeployQt)) { throw "windeployqt.exe not found at $WindeployQt" }
+
+Write-Host "==> Qt root: $QtRoot"
+Write-Host "==> windeployqt: $WindeployQt"
+$PluginsDir = Join-Path $QtRoot "plugins"
+$PlatformsDir = Join-Path $PluginsDir "platforms"
+Write-Host "==> Contents of $PlatformsDir :"
+if (Test-Path $PlatformsDir) {
+    Get-ChildItem $PlatformsDir | ForEach-Object { Write-Host "    $($_.Name)" }
+} else {
+    Write-Host "    (missing!)"
+}
+
 Write-Host "==> windeployqt MSHV.exe"
-& windeployqt --release --no-translations --no-system-d3d-compiler --no-opengl-sw "$DistDir\MSHV.exe"
-if ($LASTEXITCODE -ne 0) { throw "windeployqt failed" }
+& $WindeployQt --release --no-translations --no-system-d3d-compiler --no-opengl-sw "$DistDir\MSHV.exe"
+$wdqExit = $LASTEXITCODE
+
+# windeployqt sometimes prints "Unable to find the platform plugin" even
+# when the Qt install is intact (it happens when its qmake probe doesn't
+# match the install layout). Fall back to copying qwindows.dll by hand so
+# the bundle is functional regardless.
+$DistPlatforms = Join-Path $DistDir "platforms"
+if (-not (Test-Path (Join-Path $DistPlatforms "qwindows.dll"))) {
+    Write-Host "==> Platform plugin not deployed — copying qwindows.dll manually"
+    $qwindows = Join-Path $PlatformsDir "qwindows.dll"
+    if (-not (Test-Path $qwindows)) { throw "qwindows.dll not found at $qwindows" }
+    New-Item -ItemType Directory -Force -Path $DistPlatforms | Out-Null
+    Copy-Item $qwindows $DistPlatforms
+    # qt.conf tells the binary plugins live in .\plugins next to the exe.
+    # windeployqt uses a flat layout (platforms/ is a sibling of MSHV.exe),
+    # which the default Qt search already covers — qt.conf is belt-and-braces.
+    "[Paths]`nPlugins = ." | Set-Content -Path (Join-Path $DistDir "qt.conf") -Encoding ASCII
+}
+
+if ($wdqExit -ne 0 -and -not (Test-Path (Join-Path $DistPlatforms "qwindows.dll"))) {
+    throw "windeployqt failed and manual platform plugin copy did not recover"
+}
 
 @"
 MSHV $Version - Windows x64
